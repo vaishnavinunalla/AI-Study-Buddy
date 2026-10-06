@@ -1,9 +1,11 @@
 import streamlit as st
 import os
+import time
+from datetime import date
 from dotenv import load_dotenv
 from google import genai
 from pypdf import PdfReader
-from datetime import date
+
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -15,34 +17,189 @@ st.set_page_config(
     layout="wide"
 )
 
+
 # ============================================================
-# GEMINI API SETUP
+# LOAD ENVIRONMENT VARIABLES
 # ============================================================
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    st.error("Gemini API key not found!")
-    st.info("Please add GEMINI_API_KEY to your .env file.")
-    st.stop()
-
-try:
-    client = genai.Client(api_key=api_key)
-except Exception as e:
-    st.error("Unable to connect to Gemini.")
-    st.write(str(e))
-    st.stop()
 
 # ============================================================
-# TITLE
+# GEMINI CONFIGURATION
+# ============================================================
+
+# Primary model + fallback models.
+# If one model temporarily fails, the app tries the next one.
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
+
+MAX_RETRIES = 3
+MAX_PDF_CHARS = 100000
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+client = None
+
+if not API_KEY:
+    st.error("❌ Gemini API key not found.")
+    st.info(
+        "Please create a .env file in the project folder and add:\n\n"
+        "GEMINI_API_KEY=YOUR_API_KEY"
+    )
+else:
+    try:
+        client = genai.Client(api_key=API_KEY)
+    except Exception as e:
+        st.error("❌ Unable to initialize Gemini.")
+        st.code(str(e))
+
+
+# ============================================================
+# COMMON GEMINI FUNCTION
+# ============================================================
+
+def generate_ai_response(prompt):
+    """
+    Sends a prompt to Gemini with:
+    - retry handling
+    - 503 handling
+    - model fallback
+    - clean error messages
+    """
+
+    if client is None:
+        return None, "Gemini client is not available."
+
+    last_error = None
+
+    for model_name in MODELS:
+
+        for attempt in range(MAX_RETRIES):
+
+            try:
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+
+                if response is not None:
+
+                    text = getattr(response, "text", None)
+
+                    if text and text.strip():
+                        return text.strip(), None
+
+                    return None, "The AI returned an empty response."
+
+            except Exception as e:
+
+                last_error = str(e)
+                error_text = last_error.lower()
+
+                # ------------------------------------------------
+                # 503 / temporary server errors
+                # ------------------------------------------------
+
+                if (
+                    "503" in error_text
+                    or "unavailable" in error_text
+                    or "high demand" in error_text
+                    or "overloaded" in error_text
+                    or "temporarily" in error_text
+                ):
+
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+
+                    # Current model failed after retries.
+                    # Try next model.
+                    break
+
+                # ------------------------------------------------
+                # Rate limit
+                # ------------------------------------------------
+
+                if (
+                    "429" in error_text
+                    or "rate limit" in error_text
+                    or "resource exhausted" in error_text
+                ):
+
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(3 * (attempt + 1))
+                        continue
+
+                    break
+
+                # ------------------------------------------------
+                # Invalid API key
+                # ------------------------------------------------
+
+                if (
+                    "401" in error_text
+                    or "403" in error_text
+                    or "api key" in error_text
+                    or "permission" in error_text
+                ):
+
+                    return None, (
+                        "Gemini API key problem.\n\n"
+                        "Please check GEMINI_API_KEY in your .env file."
+                    )
+
+                # ------------------------------------------------
+                # Other error
+                # ------------------------------------------------
+
+                return None, last_error
+
+    return None, (
+        "Gemini is temporarily unavailable after multiple attempts.\n\n"
+        "Please wait for a short time and try again."
+    )
+
+
+# ============================================================
+# HELPER FUNCTION FOR AI OUTPUT
+# ============================================================
+
+def show_ai_result(title, text, error):
+
+    if error:
+        st.error("❌ " + title)
+        st.warning(error)
+        return
+
+    if text:
+        st.success("✅ " + title)
+        st.markdown(text)
+    else:
+        st.warning("⚠️ No response was generated.")
+
+
+# ============================================================
+# APP TITLE
 # ============================================================
 
 st.title("🤖 AI Study-Buddy Learning Assistant")
-st.write("📚 Your Personal AI Learning Companion")
+
+st.write(
+    "📚 Your Personal AI Learning Companion"
+)
 
 st.divider()
+
 
 # ============================================================
 # SIDEBAR
@@ -62,6 +219,7 @@ option = st.sidebar.selectbox(
     ]
 )
 
+
 # ============================================================
 # HOME
 # ============================================================
@@ -76,6 +234,7 @@ if option == "🏠 Home":
         that helps students understand and practice their subjects.
 
         You can:
+
         • Ask questions
         • Summarize study material
         • Generate MCQs
@@ -110,6 +269,23 @@ if option == "🏠 Home":
             "your important topics."
         )
 
+    st.divider()
+
+    st.subheader("✨ Features")
+
+    features = [
+        "💬 AI Question Answering",
+        "📝 Text Summarization",
+        "❓ AI MCQ Generator",
+        "📄 PDF Study Assistant",
+        "📚 PDF Question Answering",
+        "📅 Personalized Study Plan",
+    ]
+
+    for feature in features:
+        st.write("✅ " + feature)
+
+
 # ============================================================
 # ASK AI
 # ============================================================
@@ -124,51 +300,46 @@ elif option == "💬 Ask AI":
         height=150
     )
 
-    if st.button("Ask AI 🤖"):
+    if st.button("Ask AI 🤖", type="primary"):
 
-        if question.strip():
+        if not question.strip():
 
-            with st.spinner("🤔 Thinking..."):
+            st.warning("⚠️ Please enter a question.")
 
-                try:
+        else:
 
-                    response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=f"""
+            prompt = f"""
 You are an AI Study-Buddy.
 
-Help students understand their subjects.
+Help students understand academic subjects.
 
 Answer in:
 - Simple language
 - Clear points
 - Easy explanations
+- Examples when useful
 - Exam-friendly format when appropriate
+
+Do not unnecessarily make the answer complicated.
 
 Student Question:
 
 {question}
 """
-                    )
 
-                    st.success("🤖 AI Answer")
+            with st.spinner("🤔 Thinking..."):
 
-                    if response.text:
-                        st.write(response.text)
-                    else:
-                        st.warning("No answer was returned.")
+                answer, error = generate_ai_response(prompt)
 
-                except Exception as e:
+            show_ai_result(
+                "AI Answer",
+                answer,
+                error
+            )
 
-                    st.error("Error while getting AI response.")
-                    st.write(str(e))
-
-        else:
-
-            st.warning("Please enter a question.")
 
 # ============================================================
-# SUMMARIZE
+# SUMMARIZE TEXT
 # ============================================================
 
 elif option == "📝 Summarize":
@@ -181,50 +352,45 @@ elif option == "📝 Summarize":
         placeholder="Paste your notes or study material here..."
     )
 
-    if st.button("Summarize ✨"):
+    if st.button("Summarize ✨", type="primary"):
 
-        if text.strip():
+        if not text.strip():
 
-            with st.spinner("📝 Creating summary..."):
+            st.warning("⚠️ Please enter some study material.")
 
-                try:
+        else:
 
-                    response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=f"""
+            prompt = f"""
 You are an AI Study-Buddy.
 
 Summarize the following study material.
 
 Requirements:
+
 - Use simple language
 - Give important points
 - Use headings
-- Make it easy to revise
 - Keep important concepts
+- Include important definitions
+- Make it easy to revise
 - Make it exam-friendly
+- Avoid unnecessary information
 
 Study Material:
 
 {text}
 """
-                    )
 
-                    st.success("📝 Summary")
+            with st.spinner("📝 Creating summary..."):
 
-                    if response.text:
-                        st.write(response.text)
-                    else:
-                        st.warning("No summary was generated.")
+                answer, error = generate_ai_response(prompt)
 
-                except Exception as e:
+            show_ai_result(
+                "Study Summary",
+                answer,
+                error
+            )
 
-                    st.error("Error while creating summary.")
-                    st.write(str(e))
-
-        else:
-
-            st.warning("Please enter some study material.")
 
 # ============================================================
 # MCQ GENERATOR
@@ -247,21 +413,19 @@ elif option == "❓ Generate MCQs":
         step=1
     )
 
-    if st.button("Generate MCQs 🎯"):
+    if st.button("Generate MCQs 🎯", type="primary"):
 
-        if topic.strip():
+        if not topic.strip():
 
-            with st.spinner("🎯 Generating MCQs..."):
+            st.warning("⚠️ Please enter a topic.")
 
-                try:
+        else:
 
-                    response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=f"""
+            prompt = f"""
 You are an AI Study-Buddy.
 
 Generate {number} multiple-choice questions
-on the topic:
+on the following topic:
 
 {topic}
 
@@ -276,32 +440,25 @@ D)
 Correct Answer:
 Explanation:
 
-Keep the questions suitable for students
-and use clear, simple language.
+Rules:
+
+- Use simple language
+- Make questions suitable for students
+- Include a mixture of easy and moderate questions
+- Keep the answers accurate
+- Make the questions useful for exam preparation
 """
-                    )
 
-                    st.success(
-                        f"🎯 MCQs for {topic}"
-                    )
+            with st.spinner("🎯 Generating MCQs..."):
 
-                    if response.text:
-                        st.write(response.text)
-                    else:
-                        st.warning(
-                            "No MCQs were generated."
-                        )
+                answer, error = generate_ai_response(prompt)
 
-                except Exception as e:
+            show_ai_result(
+                f"MCQs for {topic}",
+                answer,
+                error
+            )
 
-                    st.error(
-                        "Error while generating MCQs."
-                    )
-                    st.write(str(e))
-
-        else:
-
-            st.warning("Please enter a topic.")
 
 # ============================================================
 # STUDY MATERIALS / PDF
@@ -333,151 +490,172 @@ elif option == "📄 Study Materials":
 
             page_count = len(reader.pages)
 
-            st.info(
-                f"📄 Total Pages: {page_count}"
-            )
+            if page_count == 0:
 
-            full_text = ""
+                st.warning("⚠️ This PDF contains no pages.")
 
-            progress = st.progress(0)
+            else:
 
-            for i, page in enumerate(reader.pages):
-
-                page_text = page.extract_text()
-
-                if page_text:
-                    full_text += page_text + "\n"
-
-                progress.progress(
-                    (i + 1) / page_count
+                st.info(
+                    f"📄 Total Pages: {page_count}"
                 )
 
-            if full_text.strip():
+                full_text = ""
 
-                st.success(
-                    "✅ PDF text extracted successfully!"
-                )
+                progress = st.progress(0)
 
-                pdf_option = st.radio(
-                    "What do you want to do with this PDF?",
-                    [
-                        "💬 Ask Questions",
-                        "📝 Summarize PDF",
-                        "❓ Generate MCQs"
-                    ],
-                    horizontal=True
-                )
+                for i, page in enumerate(reader.pages):
 
-                st.divider()
+                    try:
 
-                # ====================================================
-                # ASK QUESTIONS FROM PDF
-                # ====================================================
+                        page_text = page.extract_text()
 
-                if pdf_option == "💬 Ask Questions":
+                        if page_text:
+                            full_text += page_text + "\n"
 
-                    st.subheader(
-                        "💬 Ask a Question About Your PDF"
+                    except Exception:
+                        pass
+
+                    progress.progress(
+                        (i + 1) / page_count
                     )
 
-                    pdf_question = st.text_area(
-                        "Enter your question:",
-                        placeholder=(
-                            "Example: What are the important "
-                            "concepts discussed in this PDF?"
-                        ),
-                        height=120
+                progress.empty()
+
+                full_text = full_text.strip()
+
+                if full_text:
+
+                    original_length = len(full_text)
+
+                    # ------------------------------------------------
+                    # Protect API request size
+                    # ------------------------------------------------
+
+                    if len(full_text) > MAX_PDF_CHARS:
+
+                        full_text_for_ai = full_text[:MAX_PDF_CHARS]
+
+                        st.warning(
+                            f"⚠️ This PDF contains a large amount of text "
+                            f"({original_length:,} characters). "
+                            f"For AI processing, the first "
+                            f"{MAX_PDF_CHARS:,} characters will be used."
+                        )
+
+                    else:
+
+                        full_text_for_ai = full_text
+
+                    st.success(
+                        "✅ PDF text extracted successfully!"
                     )
 
-                    if st.button("Ask PDF 🤖"):
+                    pdf_option = st.radio(
+                        "What do you want to do with this PDF?",
+                        [
+                            "💬 Ask Questions",
+                            "📝 Summarize PDF",
+                            "❓ Generate MCQs"
+                        ],
+                        horizontal=True
+                    )
 
-                        if pdf_question.strip():
+                    st.divider()
 
-                            with st.spinner(
-                                "🤔 Reading your PDF..."
-                            ):
+                    # ====================================================
+                    # PDF ASK QUESTIONS
+                    # ====================================================
 
-                                try:
+                    if pdf_option == "💬 Ask Questions":
 
-                                    response = client.models.generate_content(
-                                        model="gemini-3.8-flash",
-                                        contents=f"""
+                        st.subheader(
+                            "💬 Ask a Question About Your PDF"
+                        )
+
+                        pdf_question = st.text_area(
+                            "Enter your question:",
+                            placeholder=(
+                                "Example: What are the important "
+                                "concepts discussed in this PDF?"
+                            ),
+                            height=120
+                        )
+
+                        if st.button(
+                            "Ask PDF 🤖",
+                            type="primary"
+                        ):
+
+                            if not pdf_question.strip():
+
+                                st.warning(
+                                    "⚠️ Please enter a question."
+                                )
+
+                            else:
+
+                                prompt = f"""
 You are an AI Study-Buddy.
 
 Answer the student's question using ONLY
 the study material provided below.
 
 Rules:
+
 - Use simple language
 - Give clear explanations
 - Use bullet points when useful
 - Do not invent information
+- If the answer is not available in the PDF, clearly say:
+  "This information is not available in the uploaded PDF."
 - Make the answer exam-friendly
 
 PDF Study Material:
 
-{full_text}
+{full_text_for_ai}
 
 Student Question:
 
 {pdf_question}
 """
+
+                                with st.spinner(
+                                    "🤔 Reading your PDF..."
+                                ):
+
+                                    answer, error = (
+                                        generate_ai_response(prompt)
                                     )
 
-                                    st.success(
-                                        "🤖 Answer"
-                                    )
+                                show_ai_result(
+                                    "PDF Answer",
+                                    answer,
+                                    error
+                                )
 
-                                    if response.text:
-                                        st.write(
-                                            response.text
-                                        )
-                                    else:
-                                        st.warning(
-                                            "No answer was returned."
-                                        )
+                    # ====================================================
+                    # PDF SUMMARY
+                    # ====================================================
 
-                                except Exception as e:
+                    elif pdf_option == "📝 Summarize PDF":
 
-                                    st.error(
-                                        "Error while asking PDF."
-                                    )
-                                    st.write(str(e))
+                        st.subheader(
+                            "📝 PDF Summary"
+                        )
 
-                        else:
-
-                            st.warning(
-                                "Please enter a question."
-                            )
-
-                # ====================================================
-                # SUMMARIZE PDF
-                # ====================================================
-
-                elif pdf_option == "📝 Summarize PDF":
-
-                    st.subheader(
-                        "📝 PDF Summary"
-                    )
-
-                    if st.button(
-                        "Summarize PDF ✨"
-                    ):
-
-                        with st.spinner(
-                            "Creating PDF summary..."
+                        if st.button(
+                            "Summarize PDF ✨",
+                            type="primary"
                         ):
 
-                            try:
-
-                                response = client.models.generate_content(
-                                    model="gemini-3.8-flash",
-                                    contents=f"""
+                            prompt = f"""
 You are an AI Study-Buddy.
 
 Summarize the following PDF study material.
 
 Requirements:
+
 - Use simple language
 - Use headings
 - Give important points
@@ -485,65 +663,52 @@ Requirements:
 - Make it easy to revise
 - Keep important concepts
 - Make it exam-friendly
+- Do not invent information
 
 PDF Study Material:
 
-{full_text}
+{full_text_for_ai}
 """
+
+                            with st.spinner(
+                                "📝 Creating PDF summary..."
+                            ):
+
+                                answer, error = (
+                                    generate_ai_response(prompt)
                                 )
 
-                                st.success(
-                                    "📝 PDF Summary"
-                                )
+                            show_ai_result(
+                                "PDF Summary",
+                                answer,
+                                error
+                            )
 
-                                if response.text:
-                                    st.write(
-                                        response.text
-                                    )
-                                else:
-                                    st.warning(
-                                        "No summary was generated."
-                                    )
+                    # ====================================================
+                    # PDF MCQs
+                    # ====================================================
 
-                            except Exception as e:
+                    elif pdf_option == "❓ Generate MCQs":
 
-                                st.error(
-                                    "Error while summarizing PDF."
-                                )
-                                st.write(str(e))
+                        st.subheader(
+                            "❓ Generate MCQs From PDF"
+                        )
 
-                # ====================================================
-                # GENERATE MCQs FROM PDF
-                # ====================================================
+                        mcq_number = st.number_input(
+                            "Number of MCQs:",
+                            min_value=1,
+                            max_value=20,
+                            value=5,
+                            step=1,
+                            key="pdf_mcq_number"
+                        )
 
-                elif pdf_option == "❓ Generate MCQs":
-
-                    st.subheader(
-                        "❓ Generate MCQs From PDF"
-                    )
-
-                    mcq_number = st.number_input(
-                        "Number of MCQs:",
-                        min_value=1,
-                        max_value=20,
-                        value=5,
-                        step=1,
-                        key="pdf_mcq_number"
-                    )
-
-                    if st.button(
-                        "Generate MCQs 🎯"
-                    ):
-
-                        with st.spinner(
-                            "Creating MCQs from PDF..."
+                        if st.button(
+                            "Generate MCQs 🎯",
+                            type="primary"
                         ):
 
-                            try:
-
-                                response = client.models.generate_content(
-                                    model="gemini-3.8-flash",
-                                    contents=f"""
+                            prompt = f"""
 You are an AI Study-Buddy.
 
 Create {mcq_number} multiple-choice questions
@@ -562,81 +727,78 @@ Correct Answer:
 Explanation:
 
 Rules:
+
 - Use simple language
 - Questions must be based on the PDF
 - Avoid information outside the PDF
+- Keep answers accurate
 - Make questions useful for exam preparation
 
 PDF Study Material:
 
-{full_text}
+{full_text_for_ai}
 """
+
+                            with st.spinner(
+                                "🎯 Creating MCQs from PDF..."
+                            ):
+
+                                answer, error = (
+                                    generate_ai_response(prompt)
                                 )
 
-                                st.success(
-                                    "🎯 PDF MCQs"
-                                )
+                            show_ai_result(
+                                "PDF MCQs",
+                                answer,
+                                error
+                            )
 
-                                if response.text:
-                                    st.write(
-                                        response.text
-                                    )
-                                else:
-                                    st.warning(
-                                        "No MCQs were generated."
-                                    )
+                    # ====================================================
+                    # VIEW PDF TEXT
+                    # ====================================================
 
-                            except Exception as e:
+                    st.divider()
 
-                                st.error(
-                                    "Error while generating MCQs."
-                                )
-                                st.write(str(e))
+                    with st.expander(
+                        "📖 View Extracted PDF Text"
+                    ):
 
-                # ====================================================
-                # VIEW EXTRACTED TEXT
-                # ====================================================
+                        st.text_area(
+                            "PDF Content",
+                            full_text,
+                            height=400
+                        )
 
-                st.divider()
+                    # ====================================================
+                    # DOWNLOAD PDF TEXT
+                    # ====================================================
 
-                with st.expander(
-                    "📖 View Extracted PDF Text"
-                ):
-
-                    st.text_area(
-                        "PDF Content",
-                        full_text,
-                        height=400
+                    st.download_button(
+                        label="📥 Download Extracted Text",
+                        data=full_text,
+                        file_name="extracted_study_material.txt",
+                        mime="text/plain"
                     )
 
-                # ====================================================
-                # DOWNLOAD TEXT
-                # ====================================================
+                else:
 
-                st.download_button(
-                    label="📥 Download Extracted Text",
-                    data=full_text,
-                    file_name="extracted_study_material.txt",
-                    mime="text/plain"
-                )
+                    st.warning(
+                        "⚠️ No readable text was found in this PDF."
+                    )
 
-            else:
-
-                st.warning(
-                    "No readable text found in this PDF."
-                )
-
-                st.info(
-                    "This may be a scanned/image-only PDF."
-                )
+                    st.info(
+                        "This may be a scanned or image-only PDF. "
+                        "Text extraction requires a text-based PDF."
+                    )
 
         except Exception as e:
 
             st.error(
-                "Error while reading the PDF."
+                "❌ Error while reading the PDF."
             )
 
-            st.write(str(e))
+            st.code(str(e))
+
 
 # ============================================================
 # PERSONALIZED STUDY PLAN
@@ -690,19 +852,26 @@ elif option == "📅 Study Plan":
         ]
     )
 
-    if st.button("Generate Study Plan 🚀"):
+    if st.button(
+        "Generate Study Plan 🚀",
+        type="primary"
+    ):
 
-        if subject.strip() and topics.strip():
+        if not subject.strip():
 
-            with st.spinner(
-                "🤖 Creating your personalized study plan..."
-            ):
+            st.warning(
+                "⚠️ Please enter the subject."
+            )
 
-                try:
+        elif not topics.strip():
 
-                    response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=f"""
+            st.warning(
+                "⚠️ Please enter the topics."
+            )
+
+        else:
+
+            prompt = f"""
 You are an AI Study-Buddy.
 
 Create a personalized study plan for a student.
@@ -725,6 +894,7 @@ Difficulty Level:
 Create a practical day-by-day study plan.
 
 For each day include:
+
 - Topics to study
 - Study time
 - Revision time
@@ -739,38 +909,24 @@ Also include:
 4. Final exam preparation tips
 
 Use simple language.
+
 Make the plan realistic and student-friendly.
 """
-                    )
 
-                    st.success(
-                        "🎯 Your Personalized Study Plan"
-                    )
+            with st.spinner(
+                "🤖 Creating your personalized study plan..."
+            ):
 
-                    if response.text:
-                        st.write(
-                            response.text
-                        )
-                    else:
-                        st.warning(
-                            "No study plan was generated."
-                        )
+                answer, error = (
+                    generate_ai_response(prompt)
+                )
 
-                except Exception as e:
-
-                    st.error(
-                        "Error while generating study plan."
-                    )
-
-                    st.write(
-                        str(e)
-                    )
-
-        else:
-
-            st.warning(
-                "Please enter the subject and topics."
+            show_ai_result(
+                "Your Personalized Study Plan",
+                answer,
+                error
             )
+
 
 # ============================================================
 # FOOTER
